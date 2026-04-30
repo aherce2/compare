@@ -4,24 +4,19 @@ inject_excel_to_bc_report.py
 
 Reads an Excel file (skipping first 3 rows) with columns: ID, S, Notes
 and injects S and Notes values into a Beyond Compare HTML report,
-matching rows by the markupID found in <td id="markupID_N"> elements.
+matching rows by <td id="markupID_N"> elements.
 
 Handles merged cells: if multiple IDs share the same S / Notes value,
 the first occurrence gets rowspan=N and subsequent cells are omitted,
 matching the merged appearance.
 
 Usage:
-    python inject_excel_to_bc_report.py \
-        --excel  data.xlsx \
-        --html   BcReport.html \
-        --output BcReport_annotated.html
+    python inject_excel_to_bc_report.py data.xlsx BcReport.html
+
+    Output is saved next to the HTML file as BcReport_annotated.html
 
     # Optional: specify which sheet (default: first sheet)
-    python inject_excel_to_bc_report.py \
-        --excel  data.xlsx \
-        --html   BcReport.html \
-        --output BcReport_annotated.html \
-        --sheet  "Sheet1"
+    python inject_excel_to_bc_report.py data.xlsx BcReport.html --sheet "Sheet1"
 
 Requirements:
     pip install openpyxl beautifulsoup4 lxml
@@ -118,27 +113,19 @@ def read_excel(path: str, sheet_name=None) -> dict:
 
 def find_markup_rows(soup: BeautifulSoup):
     """
-    Find all <td> elements whose id starts with 'markupID'.
-    Beyond Compare typically uses ids like markupID_1, markupID_2, etc.
-    but we also handle plain numeric ids or other patterns.
+    Find all <td> elements with id matching the exact pattern markupID_N
+    where N is a positive integer (e.g. markupID_1, markupID_42).
 
     Returns a list of (id_number, td_element) tuples, sorted by id_number.
     """
+    import re
+    pattern = re.compile(r'^markupID_(\d+)$')
     results = []
     for td in soup.find_all("td", id=True):
-        raw_id = td["id"]
-        # Accept  markupID_1 / markupID1 / markupid_1 (case-insensitive)
-        lower = raw_id.lower()
-        if lower.startswith("markupid"):
-            # Extract trailing integer
-            suffix = raw_id[len("markupID"):].lstrip("_")  # preserve original casing for suffix strip
-            # also handle all-lowercase
-            suffix = raw_id[8:].lstrip("_")  # 8 = len("markupID")
-            try:
-                n = int(suffix)
-                results.append((n, td))
-            except ValueError:
-                print(f"  [WARN] td id='{raw_id}' has non-integer suffix — skipped.")
+        m = pattern.match(td["id"])
+        if m:
+            results.append((int(m.group(1)), td))
+        
     results.sort(key=lambda x: x[0])
     return results
 
@@ -312,10 +299,9 @@ def add_header_columns(soup: BeautifulSoup):
 def main():
     parser = argparse.ArgumentParser(description=__doc__,
                                      formatter_class=argparse.RawDescriptionHelpFormatter)
-    parser.add_argument("--excel",  required=True, help="Path to the .xlsx file")
-    parser.add_argument("--html",   required=True, help="Path to the Beyond Compare HTML report")
-    parser.add_argument("--output", required=True, help="Path for the annotated HTML output")
-    parser.add_argument("--sheet",  default=None,  help="Excel sheet name (default: first sheet)")
+    parser.add_argument("excel", help="Path to the .xlsx file")
+    parser.add_argument("html",  help="Path to the Beyond Compare HTML report")
+    parser.add_argument("--sheet", default=None, help="Excel sheet name (default: first sheet)")
     parser.add_argument("--no-header", action="store_true",
                         help="Skip adding S/Notes header columns")
     args = parser.parse_args()
@@ -323,12 +309,14 @@ def main():
     # Validate inputs
     excel_path = Path(args.excel)
     html_path  = Path(args.html)
-    out_path   = Path(args.output)
 
     if not excel_path.exists():
         sys.exit(f"Excel file not found: {excel_path}")
     if not html_path.exists():
         sys.exit(f"HTML file not found: {html_path}")
+
+    # Auto-generate output path: same directory as HTML, with _annotated suffix
+    out_path = html_path.with_stem(html_path.stem + "_annotated")
 
     print(f"\n[1/5] Reading Excel: {excel_path}")
     records = read_excel(str(excel_path), sheet_name=args.sheet)
@@ -339,12 +327,11 @@ def main():
     html_text = html_path.read_text(encoding="utf-8", errors="replace")
     soup = BeautifulSoup(html_text, "lxml")
 
-    print(f"\n[3/5] Locating markupID elements...")
+    print(f"\n[3/5] Locating markupID_N elements...")
     markup_rows = find_markup_rows(soup)
     if not markup_rows:
-        sys.exit("No <td id='markupID...'> elements found. "
-                 "Check the HTML structure — the id attribute may differ.\n"
-                 "Hint: open the HTML in a browser, inspect a row, and look for the id pattern.")
+        sys.exit("No <td id='markupID_N'> elements found in the HTML.\n"
+                 "Hint: open the report in a browser, inspect a data row, and confirm the id pattern.")
     print(f"  Found {len(markup_rows)} markupID elements "
           f"(IDs {markup_rows[0][0]}–{markup_rows[-1][0]}).")
 
@@ -354,7 +341,6 @@ def main():
     print(f"  {len(group_map)} IDs mapped | {n_merged_groups} merged groups.")
 
     print(f"\n[5/5] Injecting columns into HTML...")
-    # Inject style
     head = soup.find("head")
     if head:
         head.append(BeautifulSoup(STYLE_BLOCK, "lxml").find("style"))
