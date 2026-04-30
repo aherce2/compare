@@ -1,0 +1,233 @@
+#!/usr/bin/env python3
+"""
+inject_excel_to_bc_report.py
+"""
+
+import argparse
+import re
+import sys
+from pathlib import Path
+
+try:
+    import openpyxl
+except ImportError:
+    sys.exit("Missing dependency: pip install openpyxl")
+
+try:
+    from bs4 import BeautifulSoup, Tag
+except ImportError:
+    sys.exit("Missing dependency: pip install beautifulsoup4 lxml")
+
+
+# ---------------------------------------------------------------------------
+# 1. Read Excel (UNCHANGED)
+# ---------------------------------------------------------------------------
+
+def read_excel(path: str, sheet_name=None) -> dict:
+    wb = openpyxl.load_workbook(path, data_only=True)
+    ws = wb[sheet_name] if sheet_name else wb.active
+
+    merged_map = {}
+    for rng in ws.merged_cells.ranges:
+        ar, ac = rng.min_row, rng.min_col
+        for r in range(rng.min_row, rng.max_row + 1):
+            for c in range(rng.min_col, rng.max_col + 1):
+                if (r, c) != (ar, ac):
+                    merged_map[(r, c)] = (ar, ac)
+
+    def cell_val(row, col):
+        coord = (row, col)
+        if coord in merged_map:
+            ar, ac = merged_map[coord]
+            return ws.cell(ar, ac).value
+        return ws.cell(row, col).value
+
+    DATA_START = 4
+    records = {}
+    for ri in range(DATA_START, ws.max_row + 1):
+        id_v = cell_val(ri, 1)
+        s_v  = cell_val(ri, 2)
+        n_v  = cell_val(ri, 3)
+        if id_v is None and s_v is None and n_v is None:
+            break
+        if id_v is None:
+            continue
+        try:
+            id_int = int(id_v)
+        except (ValueError, TypeError):
+            continue
+        records[id_int] = {
+            "s":     str(s_v) if s_v is not None else "",
+            "notes": str(n_v) if n_v is not None else "",
+        }
+
+    return records
+
+
+# ---------------------------------------------------------------------------
+# 2. Helpers (UNCHANGED + NEW INSERTION HELPER)
+# ---------------------------------------------------------------------------
+
+MARKUP_ID_RE = re.compile(r'^markupID_(\d+)$')
+
+
+def find_bc_table(soup: BeautifulSoup):
+    return soup.find("table", class_="fc")
+
+
+def markup_id_of_tr(tr: Tag):
+    for td in tr.find_all("td", id=True):
+        m = MARKUP_ID_RE.match(td["id"])
+        if m:
+            return int(m.group(1))
+    return None
+
+
+# 🔥 NEW: proper column insertion (handles colspan)
+def insert_cell_with_colspan(tr: Tag, new_cell: Tag, target_col: int):
+    col_pos = 0
+    for cell in tr.find_all(["td", "th"], recursive=False):
+        span = int(cell.get("colspan", 1))
+
+        if col_pos + span > target_col:
+            cell.insert_before(new_cell)
+            return
+
+        col_pos += span
+
+    tr.append(new_cell)
+
+
+# ---------------------------------------------------------------------------
+# 3. Compute groups (UNCHANGED)
+# ---------------------------------------------------------------------------
+
+def compute_groups(records: dict, all_ids: list) -> dict:
+    present = sorted(n for n in all_ids if n in records)
+    result = {}
+    i = 0
+    while i < len(present):
+        cur = present[i]
+        rec = records[cur]
+        span = 1
+        j = i + 1
+        while j < len(present):
+            nxt = present[j]
+            if nxt == present[j - 1] + 1 and records[nxt] == rec:
+                span += 1
+                j += 1
+            else:
+                break
+        for k in range(span):
+            gid = present[i + k]
+            result[gid] = {
+                "s":       rec["s"],
+                "notes":   rec["notes"],
+                "rowspan": span if k == 0 else 1,
+                "render":  k == 0,
+            }
+        i = j
+    return result
+
+
+# ---------------------------------------------------------------------------
+# 4. Inject (UPDATED ONLY HERE)
+# ---------------------------------------------------------------------------
+
+STYLE_BLOCK = """<style>
+.inj-s { background-color: #e8f4fd; border: 1px solid #b0d4f1; padding: 2px 6px; font-size: 0.9em; text-align: center; }
+.inj-notes { background-color: #fefce8; border: 1px solid #e2d96e; padding: 2px 6px; font-size: 0.9em; }
+.inj-hdr { background-color: #dde; border: 1px solid #99a; padding: 2px 6px; font-weight: bold; text-align: center; }
+.inj-fill { background-color: #f4f4f4; border: 1px solid #ddd; }
+</style>
+"""
+
+
+def inject_columns(soup: BeautifulSoup, table: Tag, group_map: dict):
+    INSERT_AT = 2  # 🔥 CHANGE THIS if needed
+
+    all_trs = table.find_all("tr")
+    first_tr = True
+
+    for tr in all_trs:
+        n = markup_id_of_tr(tr)
+
+        # HEADER
+        if n is None:
+            if first_tr:
+                s_th = soup.new_tag("th", attrs={"class": "inj-hdr"})
+                s_th.string = "S"
+                nt_th = soup.new_tag("th", attrs={"class": "inj-hdr"})
+                nt_th.string = "Notes"
+
+                insert_cell_with_colspan(tr, s_th, INSERT_AT)
+                insert_cell_with_colspan(tr, nt_th, INSERT_AT + 1)
+
+                first_tr = False
+            else:
+                insert_cell_with_colspan(tr, soup.new_tag("td", attrs={"class": "inj-fill"}), INSERT_AT)
+                insert_cell_with_colspan(tr, soup.new_tag("td", attrs={"class": "inj-fill"}), INSERT_AT + 1)
+            continue
+
+        first_tr = False
+
+        if n not in group_map:
+            insert_cell_with_colspan(tr, soup.new_tag("td", attrs={"class": "inj-fill"}), INSERT_AT)
+            insert_cell_with_colspan(tr, soup.new_tag("td", attrs={"class": "inj-fill"}), INSERT_AT + 1)
+            continue
+
+        g = group_map[n]
+
+        if not g["render"]:
+            continue
+
+        s_td = soup.new_tag("td", attrs={"class": "inj-s"})
+        if g["rowspan"] > 1:
+            s_td["rowspan"] = str(g["rowspan"])
+        s_td.string = g["s"]
+
+        nt_td = soup.new_tag("td", attrs={"class": "inj-notes"})
+        if g["rowspan"] > 1:
+            nt_td["rowspan"] = str(g["rowspan"])
+        nt_td.string = g["notes"]
+
+        insert_cell_with_colspan(tr, s_td, INSERT_AT)
+        insert_cell_with_colspan(tr, nt_td, INSERT_AT + 1)
+
+
+# ---------------------------------------------------------------------------
+# 5. Main (UNCHANGED)
+# ---------------------------------------------------------------------------
+
+def main():
+    parser = argparse.ArgumentParser()
+    parser.add_argument("excel")
+    parser.add_argument("html")
+    parser.add_argument("--sheet", default=None)
+    args = parser.parse_args()
+
+    excel_path = Path(args.excel)
+    html_path  = Path(args.html)
+    out_path = html_path.with_stem(html_path.stem + "_annotated")
+
+    records = read_excel(str(excel_path), sheet_name=args.sheet)
+
+    soup = BeautifulSoup(html_path.read_text(encoding="utf-8", errors="replace"), "lxml")
+
+    table = find_bc_table(soup)
+    all_ids = [markup_id_of_tr(tr) for tr in table.find_all("tr")]
+    all_ids = [n for n in all_ids if n is not None]
+
+    group_map = compute_groups(records, all_ids)
+
+    style_tag = BeautifulSoup(STYLE_BLOCK, "lxml").find("style")
+    soup.head.append(style_tag)
+
+    inject_columns(soup, table, group_map)
+
+    out_path.write_text(str(soup), encoding="utf-8")
+    print(f"Saved: {out_path}")
+
+
+if __name__ == "__main__":
+    main()
