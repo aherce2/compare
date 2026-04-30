@@ -1,359 +1,219 @@
 #!/usr/bin/env python3
-"""
-inject_excel_to_bc_report.py
-
-Reads an Excel file (skipping first 3 rows) with columns: ID, S, Notes
-and injects S and Notes values into a Beyond Compare HTML report,
-matching rows by <td id="markupID_N"> elements.
-
-Handles merged cells: if multiple IDs share the same S / Notes value,
-the first occurrence gets rowspan=N and subsequent cells are omitted,
-matching the merged appearance.
-
-Usage:
-    python inject_excel_to_bc_report.py data.xlsx BcReport.html
-
-    Output is saved next to the HTML file as BcReport_annotated.html
-
-    # Optional: specify which sheet (default: first sheet)
-    python inject_excel_to_bc_report.py data.xlsx BcReport.html --sheet "Sheet1"
-
-Requirements:
-    pip install openpyxl beautifulsoup4 lxml
-"""
 
 import argparse
+import re
 import sys
-from collections import defaultdict
 from pathlib import Path
 
-try:
-    import openpyxl
-except ImportError:
-    sys.exit("Missing dependency: pip install openpyxl")
+import openpyxl
+from bs4 import BeautifulSoup
 
-try:
-    from bs4 import BeautifulSoup
-except ImportError:
-    sys.exit("Missing dependency: pip install beautifulsoup4 lxml")
+MARKUP_ID_RE = re.compile(r'^markupID_(\d+)$')
 
+# ============================================================
+# 1. READ EXCEL
+# ============================================================
 
-# ---------------------------------------------------------------------------
-# 1. Read Excel
-# ---------------------------------------------------------------------------
-
-def read_excel(path: str, sheet_name=None) -> dict:
-    """
-    Read the Excel file, skipping the first 3 rows.
-    Expects columns in order: ID, S, Notes  (columns A, B, C).
-    Handles merged cells by forward-filling their values.
-
-    Returns a dict: { id_value (int): {"s": ..., "notes": ...} }
-    """
+def read_excel(path, sheet_name=None):
     wb = openpyxl.load_workbook(path, data_only=True)
+    ws = wb[sheet_name] if sheet_name else wb.active
 
-    if sheet_name:
-        ws = wb[sheet_name]
-    else:
-        ws = wb.active
+    merged_map = {}
+    for rng in ws.merged_cells.ranges:
+        for r in range(rng.min_row, rng.max_row + 1):
+            for c in range(rng.min_col, rng.max_col + 1):
+                merged_map[(r, c)] = (rng.min_row, rng.min_col)
 
-    # --- Resolve merged cell ranges so every cell has a value ---
-    # openpyxl leaves merged (non-anchor) cells as None; we fill them
-    # with the anchor cell's value.
-    merged_map = {}  # (row, col) -> (anchor_row, anchor_col)
-    for merge_range in ws.merged_cells.ranges:
-        anchor_row = merge_range.min_row
-        anchor_col = merge_range.min_col
-        for row in range(merge_range.min_row, merge_range.max_row + 1):
-            for col in range(merge_range.min_col, merge_range.max_col + 1):
-                if (row, col) != (anchor_row, anchor_col):
-                    merged_map[(row, col)] = (anchor_row, anchor_col)
-
-    def cell_value(ws, row, col):
-        coord = (row, col)
-        if coord in merged_map:
-            ar, ac = merged_map[coord]
+    def get_val(r, c):
+        if (r, c) in merged_map:
+            ar, ac = merged_map[(r, c)]
             return ws.cell(ar, ac).value
-        return ws.cell(row, col).value
-
-    # Rows 1-3 are skipped; data starts at row 4
-    DATA_START_ROW = 4  # 1-indexed in openpyxl
+        return ws.cell(r, c).value
 
     records = {}
-    for row_idx in range(DATA_START_ROW, ws.max_row + 1):
-        id_val   = cell_value(ws, row_idx, 1)   # Column A = ID
-        s_val    = cell_value(ws, row_idx, 2)   # Column B = S
-        notes_val = cell_value(ws, row_idx, 3)  # Column C = Notes
-
-        # Stop at first completely empty row
-        if id_val is None and s_val is None and notes_val is None:
-            break
-
-        if id_val is None:
+    for r in range(4, ws.max_row + 1):
+        id_v = get_val(r, 1)
+        if id_v is None:
             continue
 
         try:
-            id_int = int(id_val)
-        except (ValueError, TypeError):
-            print(f"  [WARN] Row {row_idx}: ID '{id_val}' is not an integer — skipped.")
+            id_v = int(id_v)
+        except:
             continue
 
-        records[id_int] = {
-            "s":     str(s_val)     if s_val     is not None else "",
-            "notes": str(notes_val) if notes_val is not None else "",
+        records[id_v] = {
+            "s": str(get_val(r, 2) or ""),
+            "notes": str(get_val(r, 3) or "")
         }
 
-    print(f"  Loaded {len(records)} records from Excel (IDs {min(records)} – {max(records)}).")
     return records
 
 
-# ---------------------------------------------------------------------------
-# 2. Parse HTML and find markupID rows
-# ---------------------------------------------------------------------------
+# ============================================================
+# 2. HTML HELPERS
+# ============================================================
 
-def find_markup_rows(soup: BeautifulSoup):
-    """
-    Find all <td> elements with id matching the exact pattern markupID_N
-    where N is a positive integer (e.g. markupID_1, markupID_42).
+def find_table(soup):
+    return soup.find("table", class_="fc")
 
-    Returns a list of (id_number, td_element) tuples, sorted by id_number.
-    """
-    import re
-    pattern = re.compile(r'^markupID_(\d+)$')
-    results = []
-    for td in soup.find_all("td", id=True):
-        m = pattern.match(td["id"])
+
+def get_markup_id(tr):
+    for td in tr.find_all("td", id=True):
+        m = MARKUP_ID_RE.match(td["id"])
         if m:
-            results.append((int(m.group(1)), td))
-        
-    results.sort(key=lambda x: x[0])
-    return results
+            return int(m.group(1))
+    return None
 
 
-# ---------------------------------------------------------------------------
-# 3. Compute merged-cell groups
-# ---------------------------------------------------------------------------
+# ============================================================
+# 3. GROUP ROWSPAN (UNCHANGED LOGIC)
+# ============================================================
 
-def compute_groups(records: dict, markup_ids: list) -> dict:
-    """
-    For each markupID present in the HTML, determine if consecutive IDs
-    share the same (s, notes) value — indicating merged cells in Excel.
+def compute_groups(records, ids):
+    ids = sorted(i for i in ids if i in records)
+    out = {}
 
-    Returns a dict:
-        { id_number: {"s": ..., "notes": ..., "rowspan": N, "render": bool} }
-
-    render=False means this row's S/Notes cells should be omitted
-    (they were covered by a rowspan from an earlier row).
-    """
-    present_ids = sorted([n for n, _ in markup_ids if n in records])
-
-    # Group consecutive IDs with identical (s, notes)
-    groups = []
     i = 0
-    while i < len(present_ids):
-        current_id = present_ids[i]
-        current_rec = records[current_id]
+    while i < len(ids):
+        base = ids[i]
+        rec = records[base]
+
         span = 1
         j = i + 1
-        while j < len(present_ids):
-            next_id = present_ids[j]
-            # Only group if IDs are truly consecutive
-            if next_id == present_ids[j - 1] + 1 and records[next_id] == current_rec:
-                span += 1
-                j += 1
-            else:
-                break
+        while j < len(ids) and ids[j] == ids[j-1] + 1 and records[ids[j]] == rec:
+            span += 1
+            j += 1
+
         for k in range(span):
-            gid = present_ids[i + k]
-            groups.append({
-                "id": gid,
-                "s": current_rec["s"],
-                "notes": current_rec["notes"],
-                "rowspan": span if k == 0 else 0,  # 0 = suppressed
-                "render": k == 0,
-            })
+            out[ids[i + k]] = {
+                "s": rec["s"],
+                "notes": rec["notes"],
+                "rowspan": span if k == 0 else 1,
+                "render": k == 0
+            }
+
         i = j
 
-    return {g["id"]: g for g in groups}
+    return out
 
 
-# ---------------------------------------------------------------------------
-# 4. Inject into HTML
-# ---------------------------------------------------------------------------
+# ============================================================
+# 4. COLUMN INSERTION (FIXED CORE)
+# ============================================================
 
-STYLE_BLOCK = """
-<style>
-/* Injected by inject_excel_to_bc_report.py */
-.injected-s {
-    background-color: #e8f4fd;
-    border: 1px solid #b0d4f1;
-    padding: 2px 6px;
-    font-size: 0.9em;
-    vertical-align: middle;
-    text-align: center;
-    white-space: pre-wrap;
-    word-break: break-word;
-    max-width: 120px;
-}
-.injected-notes {
-    background-color: #fefce8;
-    border: 1px solid #e2d96e;
-    padding: 2px 6px;
-    font-size: 0.9em;
-    vertical-align: middle;
-    white-space: pre-wrap;
-    word-break: break-word;
-    max-width: 200px;
-}
-.injected-empty {
-    background-color: #f9f9f9;
-    border: 1px solid #ddd;
-    padding: 2px 6px;
-    color: #aaa;
-    font-size: 0.85em;
-    vertical-align: middle;
-    text-align: center;
-}
-</style>
-"""
-
-def inject(soup: BeautifulSoup, markup_rows: list, group_map: dict):
+def insert_at_visual_column(tr, new_cell, target_col):
     """
-    For each markupID <td>, insert S and Notes <td> elements
-    immediately after it in the same <tr>.
-    Applies rowspan for merged groups.
+    Insert cell based on visual column index, respecting colspan.
     """
-    injected = 0
-    skipped  = 0
-    missing  = 0
+    col_pos = 0
 
-    for n, td in markup_rows:
-        tr = td.parent
-        if tr is None or tr.name != "tr":
-            print(f"  [WARN] markupID_{n}: parent is not a <tr> — skipped.")
+    for cell in tr.find_all(["td", "th"], recursive=False):
+        span = int(cell.get("colspan", 1))
+
+        if col_pos + span > target_col:
+            cell.insert_before(new_cell)
+            return
+
+        col_pos += span
+
+    tr.append(new_cell)
+
+
+# ============================================================
+# 5. MAIN INJECTION LOGIC
+# ============================================================
+
+INSERT_COL = 2  # <-- CHANGE THIS if needed
+
+
+def inject(soup, table, group_map):
+    trs = table.find_all("tr")
+
+    first_row = True
+
+    for tr in trs:
+        mid = get_markup_id(tr)
+
+        # HEADER ROW
+        if mid is None and first_row:
+            th1 = soup.new_tag("th")
+            th1.string = "S"
+
+            th2 = soup.new_tag("th")
+            th2.string = "Notes"
+
+            insert_at_visual_column(tr, th1, INSERT_COL)
+            insert_at_visual_column(tr, th2, INSERT_COL + 1)
+
+            first_row = False
             continue
 
-        if n not in group_map:
-            # ID exists in HTML but not in Excel — insert placeholder
-            s_td = soup.new_tag("td", attrs={"class": "injected-empty"})
-            s_td.string = "—"
-            n_td = soup.new_tag("td", attrs={"class": "injected-empty"})
-            n_td.string = "—"
-            td.insert_after(n_td)
-            td.insert_after(s_td)
-            missing += 1
+        # NON-DATA ROW
+        if mid is None:
+            insert_at_visual_column(tr, soup.new_tag("td"), INSERT_COL)
+            insert_at_visual_column(tr, soup.new_tag("td"), INSERT_COL + 1)
             continue
 
-        g = group_map[n]
+        # DATA ROW NO RECORD
+        if mid not in group_map:
+            insert_at_visual_column(tr, soup.new_tag("td"), INSERT_COL)
+            insert_at_visual_column(tr, soup.new_tag("td"), INSERT_COL + 1)
+            continue
 
+        g = group_map[mid]
+
+        # ROWSPAN SKIP
         if not g["render"]:
-            # This row is covered by a rowspan above — don't add cells
-            skipped += 1
             continue
 
-        # Build S cell
-        s_td = soup.new_tag("td", attrs={"class": "injected-s"})
-        if g["rowspan"] > 1:
-            s_td["rowspan"] = str(g["rowspan"])
+        # CREATE CELLS
+        s_td = soup.new_tag("td")
         s_td.string = g["s"]
 
-        # Build Notes cell
-        n_td = soup.new_tag("td", attrs={"class": "injected-notes"})
-        if g["rowspan"] > 1:
-            n_td["rowspan"] = str(g["rowspan"])
+        n_td = soup.new_tag("td")
         n_td.string = g["notes"]
 
-        # Insert after the markupID td (order: td → s_td → n_td)
-        td.insert_after(n_td)
-        td.insert_after(s_td)
-        injected += 1
+        if g["rowspan"] > 1:
+            s_td["rowspan"] = str(g["rowspan"])
+            n_td["rowspan"] = str(g["rowspan"])
 
-    print(f"  Injected: {injected} rows | Rowspan-skipped: {skipped} | No Excel data: {missing}")
-
-
-def add_header_columns(soup: BeautifulSoup):
-    """
-    Add 'S' and 'Notes' header columns to any header row that has a
-    cell containing 'markupID' (Beyond Compare header rows sometimes
-    differ — we do a best-effort search).
-    """
-    # Look for any <th> or header <td> that mentions the file names,
-    # since BC doesn't always use a conventional <thead>.
-    # We add headers to the FIRST <tr> in the table.
-    tables = soup.find_all("table", class_="fc")
-    for table in tables:
-        first_tr = table.find("tr")
-        if first_tr:
-            s_th = soup.new_tag("th")
-            s_th.string = "S"
-            n_th = soup.new_tag("th")
-            n_th.string = "Notes"
-            first_tr.append(s_th)
-            first_tr.append(n_th)
+        insert_at_visual_column(tr, s_td, INSERT_COL)
+        insert_at_visual_column(tr, n_td, INSERT_COL + 1)
 
 
-# ---------------------------------------------------------------------------
-# 5. Main
-# ---------------------------------------------------------------------------
+# ============================================================
+# 6. MAIN
+# ============================================================
 
 def main():
-    parser = argparse.ArgumentParser(description=__doc__,
-                                     formatter_class=argparse.RawDescriptionHelpFormatter)
-    parser.add_argument("excel", help="Path to the .xlsx file")
-    parser.add_argument("html",  help="Path to the Beyond Compare HTML report")
-    parser.add_argument("--sheet", default=None, help="Excel sheet name (default: first sheet)")
-    parser.add_argument("--no-header", action="store_true",
-                        help="Skip adding S/Notes header columns")
+    parser = argparse.ArgumentParser()
+    parser.add_argument("excel")
+    parser.add_argument("html")
+    parser.add_argument("--sheet", default=None)
     args = parser.parse_args()
 
-    # Validate inputs
-    excel_path = Path(args.excel)
-    html_path  = Path(args.html)
+    excel = Path(args.excel)
+    html = Path(args.html)
 
-    if not excel_path.exists():
-        sys.exit(f"Excel file not found: {excel_path}")
-    if not html_path.exists():
-        sys.exit(f"HTML file not found: {html_path}")
+    records = read_excel(excel, args.sheet)
 
-    # Auto-generate output path: same directory as HTML, with _annotated suffix
-    out_path = html_path.with_stem(html_path.stem + "_annotated")
+    soup = BeautifulSoup(html.read_text(encoding="utf-8"), "lxml")
 
-    print(f"\n[1/5] Reading Excel: {excel_path}")
-    records = read_excel(str(excel_path), sheet_name=args.sheet)
-    if not records:
-        sys.exit("No records found in Excel. Check that data starts at row 4 (after 3 header rows).")
+    table = find_table(soup)
+    if not table:
+        sys.exit("No BC table found")
 
-    print(f"\n[2/5] Parsing HTML: {html_path}")
-    html_text = html_path.read_text(encoding="utf-8", errors="replace")
-    soup = BeautifulSoup(html_text, "lxml")
+    ids = [get_markup_id(tr) for tr in table.find_all("tr")]
+    ids = [i for i in ids if i is not None]
 
-    print(f"\n[3/5] Locating markupID_N elements...")
-    markup_rows = find_markup_rows(soup)
-    if not markup_rows:
-        sys.exit("No <td id='markupID_N'> elements found in the HTML.\n"
-                 "Hint: open the report in a browser, inspect a data row, and confirm the id pattern.")
-    print(f"  Found {len(markup_rows)} markupID elements "
-          f"(IDs {markup_rows[0][0]}–{markup_rows[-1][0]}).")
+    group_map = compute_groups(records, ids)
 
-    print(f"\n[4/5] Computing merged-cell groups...")
-    group_map = compute_groups(records, markup_rows)
-    n_merged_groups = sum(1 for g in group_map.values() if g["rowspan"] > 1)
-    print(f"  {len(group_map)} IDs mapped | {n_merged_groups} merged groups.")
+    inject(soup, table, group_map)
 
-    print(f"\n[5/5] Injecting columns into HTML...")
-    head = soup.find("head")
-    if head:
-        head.append(BeautifulSoup(STYLE_BLOCK, "lxml").find("style"))
-    else:
-        soup.find("body").insert(0, BeautifulSoup(STYLE_BLOCK, "lxml").find("style"))
+    out = html.with_stem(html.stem + "_annotated")
+    out.write_text(str(soup), encoding="utf-8")
 
-    if not args.no_header:
-        add_header_columns(soup)
-
-    inject(soup, markup_rows, group_map)
-
-    out_path.write_text(str(soup), encoding="utf-8")
-    print(f"\n✓ Annotated report saved to: {out_path}\n")
+    print(f"Saved -> {out}")
 
 
 if __name__ == "__main__":
